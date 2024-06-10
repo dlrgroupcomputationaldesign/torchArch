@@ -42,6 +42,8 @@ if __name__ == "__main__":
             "jinja2",
             "lmdb",
             "fair-esm",
+            "azure-storage-blob",
+            "pandas"
         ],
         python_requires=">=3.7,<3.11",
         classifiers=[
