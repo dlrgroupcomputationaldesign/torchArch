@@ -32,6 +32,28 @@ class NormalizeTarget(core.Configurable):
             else:
                 raise ValueError("Can't find target `%s` in data item" % k)
         return item
+    
+@R.register("transforms.RemapItemType")
+class RemapItemType(core.Configurable):
+    """
+    Map atom types to their index in a vocabulary. Atom types that don't present in the vocabulary are mapped to -1.
+
+    Parameters:
+        atom_types (array_like): vocabulary of atom types
+    """
+
+    def __init__(self, item_types):
+        atom_types = torch.as_tensor(item_types)
+        self.id2atom = item_types
+        self.atom2id = - torch.ones(item_types.max() + 1, dtype=torch.long, device=item_types.device)
+        self.atom2id[item_types] = torch.arange(len(item_types), device=item_types.device)
+
+    def __call__(self, item):
+        graph = copy.copy(item["graph"])
+        graph.item_type = self.item2id[graph.atom_type]
+        item = item.copy()
+        item["graph"] = graph
+        return item
 
 
 @R.register("transforms.RemapAtomType")
@@ -43,15 +65,20 @@ class RemapAtomType(core.Configurable):
         atom_types (array_like): vocabulary of atom types
     """
 
-    def __init__(self, atom_types):
-        atom_types = torch.as_tensor(atom_types)
+    def __init__(self, atom_types, node_type=None):
+        if node_type:
+            self.node_type = node_type
+        atom_types = torch.as_tensor(atom_types, dtype=torch.long)
         self.id2atom = atom_types
-        self.atom2id = - torch.ones(atom_types.max() + 1, dtype=torch.long, device=atom_types.device)
-        self.atom2id[atom_types] = torch.arange(len(atom_types), device=atom_types.device)
+        self.atom2id = - torch.ones(int(atom_types.max().item()) + 1, dtype=torch.long, device=atom_types.device)
+        self.atom2id[atom_types] = torch.arange(len(atom_types), device=atom_types.device, dtype=torch.long)
 
     def __call__(self, item):
         graph = copy.copy(item["graph"])
-        graph.atom_type = self.atom2id[graph.atom_type]
+        if node_type == "item":
+            graph.item_type = self.item2id[graph.item_type]
+        else:
+            graph.atom_type = self.atom2id[graph.atom_type]
         item = item.copy()
         item["graph"] = graph
         return item

@@ -1,13 +1,16 @@
 import os
+import re
 import csv
 import math
 import lmdb
 import pickle
 import logging
 import warnings
+from io import BytesIO
 from collections import defaultdict
 from collections.abc import Sequence
-
+import pandas as pd
+import numpy as np
 from tqdm import tqdm
 
 import numpy as np
@@ -18,9 +21,189 @@ import torch
 from torch.utils import data as torch_data
 
 from torchdrug import core, data, utils
-
+from torchdrug.data.connectors import connect_to_blob_service_client
 
 logger = logging.getLogger(__name__)
+
+
+## TODO Create a Room Layout Dataset that extends  torch_data.Dataset and store RoomLayout Objects to be defined in torchdrug/data/Room
+
+class RoomLayoutDataset(torch_data.Dataset, core.Configurable):
+    """
+    Room Layout dataset.
+
+    Each sample contains a Room Layout graph, and any number of prediction targets.
+    """
+    def __init__(self):
+        return 
+
+    def load_blobs_dataset(self, blob_container_path, export_id, transform=None):
+        """Loads room layouts data fromc blob storage"""
+
+        client = connect_to_blob_service_client()
+        container_client = client.get_container_client(blob_container_path)
+        self.transform = transform
+        self.dataset_type = blob_container_path
+        self.dataset_run = export_id
+
+        self.unique_items = {}
+
+        blobs = container_client.list_blobs(name_starts_with=self.dataset_run)
+
+        self.data = []
+        self.targets = defaultdict(list)
+        rooms = set()
+        features = []
+        adjcacencies = []
+
+        
+
+
+        
+        for blob in blobs:
+            np_adj_matrix = df_feature = None
+            if len(blob.name.split("/")) == 2:
+                room_id = blob.name.split('/')[1]
+                rooms.add(room_id)
+                room_data = container_client.list_blobs(name_starts_with=blob.name)
+
+                for data_blob in room_data:
+                    if 'adj_matrix.npy' in data_blob.name:
+                        np_adj_matrix = self.load_npy_from_blob(container_client, data_blob.name)
+                        adjcacencies.append(np_adj_matrix)
+                    if "feature.csv" in data_blob.name:
+                        df_feature = self.load_csv_from_blob(container_client, data_blob.name)
+                        features.append(df_feature)
+            
+                if np_adj_matrix is not None and df_feature is not None:
+                    pass
+                else:
+                    raise(ValueError(f"Adjacency or Features Not Set for room {room_id}"))
+
+                
+                room = data.Room.from_room_graph_definition(item_feature=df_feature, adj_matrix=np_adj_matrix)
+                self.data.append(room)
+                self.targets["T"].append(1)
+
+        self.num_rooms = len(rooms)
+
+        print(f"Number of rooms: {self.num_rooms}")
+
+        
+        
+        return self 
+
+    def load_npy_from_blob(self, container_client, blob_name):
+        """Load the adjacency.npy file from the blob storage"""
+        blob_client = container_client.get_blob_client(blob_name)
+        stream = BytesIO()
+        blob_client.download_blob().readinto(stream)
+        stream.seek(0)
+        adjacency_npy = np.load(stream)
+        return adjacency_npy
+
+    def load_csv_from_blob(self, container_client, blob_name):
+        """Load the feature.csv file from the blob storage into a pandas DataFrame"""
+        blob_client = container_client.get_blob_client(blob_name)
+        stream = BytesIO()
+        blob_client.download_blob().readinto(stream)
+        stream.seek(0)
+        df_feature = pd.read_csv(stream)
+        return df_feature
+    
+    def _standarize_index(self, index, count):
+        if isinstance(index, slice):
+            start = index.start or 0
+            if start < 0:
+                start += count
+            stop = index.stop or count
+            if stop < 0:
+                stop += count
+            step = index.step or 1
+            index = range(start, stop, step)
+        elif not isinstance(index, list):
+            raise ValueError("Unknown index `%s`" % index)
+        return index
+
+    def get_item(self, index):
+        
+        item = {"graph": self.data[index]}
+        item.update({k: v[index] for k, v in self.targets.items()})
+        if self.transform:
+            item = self.transform(item)
+        return item
+
+    def __getitem__(self, index):
+        if isinstance(index, int):
+            return self.get_item(index)
+
+        index = self._standarize_index(index, len(self))
+        return [self.get_item(i) for i in index]
+
+    @property
+    def tasks(self):
+        """List of tasks."""
+        return list(self.targets.keys())
+
+    @property
+    def node_feature_dim(self):
+        """Dimension of node features."""
+        return self.data[0].node_feature.shape[-1]
+
+    @property
+    def edge_feature_dim(self):
+        """Dimension of edge features."""
+        return self.data[0].edge_feature.shape[-1]
+
+    @property
+    def num_atom_type(self):
+        """Number of different atom types."""
+        return len(self.atom_types)
+
+    @property
+    def num_bond_type(self):
+        """Number of different bond types."""
+        return len(self.bond_types)
+
+    @utils.cached_property
+    def item_types(self):
+        """All item types."""
+        item_types = set()
+
+        
+    
+        for graph in self.data:
+            item_types.update(graph.item_type.tolist())
+
+        return sorted(item_types)
+
+    @utils.cached_property
+    def bond_types(self):
+        """All bond types."""
+        bond_types = set()
+
+        if getattr(self, "lazy", False):
+            warnings.warn("Calling this function for dataset with lazy=True may take a large amount of time.")             
+            for smiles in self.smiles_list:
+                graph = data.Molecule.from_smiles(smiles, **self.kwargs)
+                bond_types.update(graph.edge_list[:, 2].tolist())
+        else:
+            for graph in self.data:
+                bond_types.update(graph.edge_list[:, 2].tolist())
+
+        return sorted(bond_types)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __repr__(self):
+        lines = [
+            "#sample: %d" % len(self),
+            "#task: %d" % len(self.tasks),
+        ]
+        return "%s(\n  %s\n)" % (self.__class__.__name__, "\n  ".join(lines))
+
+
 
 
 class MoleculeDataset(torch_data.Dataset, core.Configurable):

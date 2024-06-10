@@ -1,6 +1,7 @@
 from .dictionary import PerfectHash, Dictionary
 from .graph import Graph, PackedGraph, cat
 from .molecule import Molecule, PackedMolecule
+from .room import Room
 from .protein import Protein, PackedProtein
 from .dataset import MoleculeDataset, ReactionDataset, ProteinDataset, \
     ProteinPairDataset, ProteinLigandDataset, \
@@ -11,7 +12,7 @@ from . import constant
 from . import feature
 
 __all__ = [
-    "Graph", "PackedGraph", "Molecule", "PackedMolecule", "Protein", "PackedProtein", "PerfectHash", "Dictionary",
+    "Graph", "PackedGraph", "Room","Molecule", "PackedMolecule", "Protein", "PackedProtein", "PerfectHash", "Dictionary",
     "MoleculeDataset", "ReactionDataset", "NodeClassificationDataset", "KnowledgeGraphDataset", "SemiSupervised",
     "ProteinDataset", "ProteinPairDataset", "ProteinLigandDataset",
     "semisupervised", "key_split", "scaffold_split", "ordered_scaffold_split",

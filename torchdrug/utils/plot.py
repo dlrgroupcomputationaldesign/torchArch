@@ -4,7 +4,7 @@ import json
 import jinja2
 from PIL import Image
 
-from rdkit.Chem import AllChem, Draw
+# from rdkit.Chem import AllChem, Draw
 
 
 path = os.path.join(os.path.dirname(__file__), "template")
