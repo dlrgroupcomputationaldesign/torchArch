@@ -147,19 +147,32 @@ class RelationalGraphConvolutionalNetwork(nn.Module, core.Configurable):
                 node representations of shape :math:`(|V|, d)`, graph representations of shape :math:`(n, d)`
         """
         hiddens = []
+
+        # firt pass layer_input = input node features
         layer_input = input
 
+        # itterate through each RGCN layer
         for layer in self.layers:
+            # pass graph and layer_input into layer
+            ## Note: 
+            ## For the first pass layer_input = input (see lines above)
+            ## For all following passes layer_input = the output of the last pass (see following lines of code)
             hidden = layer(graph, layer_input)
             if self.short_cut and hidden.shape == layer_input.shape:
                 hidden = hidden + layer_input
             hiddens.append(hidden)
+            
+            # set next layer input to the hidden ouput of this layer
             layer_input = hidden
 
         if self.concat_hidden:
+            # if asked for all hidden values concatenated -- do so
             node_feature = torch.cat(hiddens, dim=-1)
         else:
+            # if not asked for all layer values, just return the final node features
             node_feature = hiddens[-1]
+
+        # get the graph features -- either average of all node features or sum (sum by default, set in init)
         graph_feature = self.readout(graph, node_feature)
 
         return {

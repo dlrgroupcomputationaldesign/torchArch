@@ -633,7 +633,7 @@ class GCPNGeneration(tasks.Task, core.Configurable):
     _option_members = {"task", "criterion"}
 
     def __init__(self, model, atom_types, max_edge_unroll=None, max_node=None, task=(), criterion="nll",
-                 hidden_dim_mlp=128, agent_update_interval=10, gamma=0.9, reward_temperature=1, baseline_momentum=0.9):
+                 hidden_dim_mlp=128, agent_update_interval=10, gamma=0.9, reward_temperature=1, baseline_momentum=0.9, node_type=None, arch=True):
         super(GCPNGeneration, self).__init__()
         self.model = model
         self.task = task
@@ -647,19 +647,30 @@ class GCPNGeneration(tasks.Task, core.Configurable):
         self.baseline_momentum = baseline_momentum
         self.best_results = defaultdict(list)
         self.batch_id = 0
+        self.node_type = node_type
 
+        # remap_atom_type = transforms.RemapAtomType(atom_types)
+        if self.node_type:
+            remap_atom_type = transforms.RemapAtomType(atom_types, node_type=self.node_type)
+        else:
+            remap_atom_type = transforms.RemapAtomType(atom_types)
 
-        remap_atom_type = transforms.RemapAtomType(atom_types)
         self.register_buffer("id2atom", remap_atom_type.id2atom)
         self.register_buffer("atom2id", remap_atom_type.atom2id)
 
         self.new_atom_embeddings = nn.Parameter(torch.zeros(self.id2atom.size(0), self.model.output_dim))
         nn.init.normal_(self.new_atom_embeddings, mean=0, std=0.1)
+        
+        ## Note: model output dim is the same for both graph embedding and node level embeddings
+
         self.inp_dim_stop = self.model.output_dim
         self.mlp_stop = layers.MultiLayerPerceptron(self.inp_dim_stop, [self.hidden_dim_mlp, 2], activation='tanh')
 
+        # for mlp_node1 input dim is output dim * 2 to account for two node features being passed as a concatenated embedding
         self.inp_dim_node1 = self.model.output_dim + self.model.output_dim
         self.mlp_node1 = layers.MultiLayerPerceptron(self.inp_dim_node1, [self.hidden_dim_mlp, 1], activation='tanh')
+
+        # for mlp_node1 input dim is output dim * 2 to account for two node features being passed as a concatenated embedding
         self.inp_dim_node2 = 2 * self.model.output_dim + self.model.output_dim
         self.mlp_node2 = layers.MultiLayerPerceptron(self.inp_dim_node2, [self.hidden_dim_mlp, 1], activation='tanh')
         self.inp_dim_edge = 2 * self.model.output_dim
@@ -679,7 +690,12 @@ class GCPNGeneration(tasks.Task, core.Configurable):
 
         Compute ``max_edge_unroll`` and ``max_node`` on the training set if not provided.
         """
-        remap_atom_type = transforms.RemapAtomType(train_set.atom_types)
+        if self.node_type:
+            emap_atom_type = transforms.RemapAtomType(train_set.item_types, node_type=self.node_type)
+        else:
+            emap_atom_type = transforms.RemapAtomType(train_set.atom_types)
+
+        ## TODO Explore what transform does     
         train_set.transform = transforms.Compose([
             train_set.transform,
             transforms.RandomBFSOrder(),
@@ -723,19 +739,34 @@ class GCPNGeneration(tasks.Task, core.Configurable):
     def predict(self, graph, label_dict, use_agent=False):
         # step1: get node/graph embeddings
         if not use_agent:
+            # run the graph and the graph features into the model found @ models/gcn/RelationalGraphConvolutionalNetwork
+            # PackedMol at this point
             output = self.model(graph, graph.node_feature.float())
         else:
             output = self.agent_model(graph, graph.node_feature.float())
 
+        ## TODO Validate how id2atoms should work in building contexts. 
+        """
+        The use of extended_node2graph and the subsequent operations are designed to handle
+        specific requirements for predicting nodes and edges, including considering new nodes
+        that might be added during the graph generation process. 
+
+        When extended_node2graph is used to index output["graph_feature"], it ensures that each node,
+        including new potential nodes, can access the graph-level feature corresponding to its graph.
+        This is crucial for making accurate predictions about node additions, edge formations, and
+        other graph-related tasks.
+        """
+
         extended_node2graph = torch.arange(graph.num_nodes.size(0), 
-                device=self.device).unsqueeze(1).repeat([1, self.id2atom.size(0)]).view(-1) # (num_graph * 16)
-        extended_node2graph = torch.cat((graph.node2graph, extended_node2graph)) # (num_node + 16 * num_graph)
+                device=self.device).unsqueeze(1).repeat([1, self.id2atom.size(0)]).view(-1) # (num_graph * # of new node types)
+        extended_node2graph = torch.cat((graph.node2graph, extended_node2graph)) # (num_node + # of new node types * num_graph)
 
         graph_feature_per_node = output["graph_feature"][extended_node2graph]
 
         # step2: predict stop
         stop_feature = output["graph_feature"] #(num_graph, n_out)
         if not use_agent:
+            # run the graph features through MLP Stop
             stop_logits = self.mlp_stop(stop_feature) #(num_graph, 2)
         else:
             stop_logits = self.agent_mlp_stop(stop_feature) #(num_graph, 2)
@@ -745,21 +776,24 @@ class GCPNGeneration(tasks.Task, core.Configurable):
         # step3: predict first node: node1
         node1_feature = output["node_feature"] #(num_node, n_out)
 
+
         node1_feature = torch.cat((node1_feature, 
-                    self.new_atom_embeddings.repeat([graph.num_nodes.size(0), 1])), 0) # (num_node + 16 * num_graph, n_out)
+                    self.new_atom_embeddings.repeat([graph.num_nodes.size(0), 1])), 0) # (num_node + # of new node types * num_graph, n_out)
 
         node2_feature_node2 = node1_feature.clone() # (num_node + 16 * num_graph, n_out)
         # cat graph emb
-        node1_feature = torch.cat((node1_feature, graph_feature_per_node), 1)
+        node1_feature = torch.cat((node1_feature, graph_feature_per_node), 1) # (num_node + num_graph * num_new_node_types, node_features_dims + graph_feature_dims)
+
 
         if not use_agent:
-            node1_logits = self.mlp_node1(node1_feature).squeeze(1)  #(num_node + 16 * num_graph)
+            node1_logits = self.mlp_node1(node1_feature).squeeze(1)  #(num_node + # of new node types * num_graph)
         else:
-            node1_logits = self.agent_mlp_node1(node1_feature).squeeze(1)  #(num_node + 16 * num_graph)
+            node1_logits = self.agent_mlp_node1(node1_feature).squeeze(1)  #(num_node + # of new node types * num_graph)
 
-        #mask the extended part
+        #mask the extended part -- get only "true nodes" 
         mask = torch.zeros(node1_logits.size(), device=self.device)
         mask[:graph.num_node] = 1
+        # setting the logits to -10000 for nodes not originally in graph makes it impossible for them to be selected as a first node
         node1_logits = torch.where(mask>0, node1_logits, -10000.0*torch.ones(node1_logits.size(), device=self.device))
 
         # step4: predict second node: node2
@@ -767,11 +801,11 @@ class GCPNGeneration(tasks.Task, core.Configurable):
         node1_index_per_graph = (graph.num_cum_nodes - graph.num_nodes) + label_dict["label1"] #(num_graph)
         node1_index = node1_index_per_graph[extended_node2graph] # (num_node + 16 * num_graph)
         node2_feature_node1 = node1_feature[node1_index] #(num_node + 16 * num_graph, n_out)
-        node2_feature = torch.cat((node2_feature_node1, node2_feature_node2), 1) #(num_node + 16 * num_graph, 2n_out) 
+        node2_feature = torch.cat((node2_feature_node1, node2_feature_node2), 1) #(num_node + # of new node types * num_graph, 2n_out) 
         if not use_agent:
-            node2_logits = self.mlp_node2(node2_feature).squeeze(1)  #(num_node + 16 * num_graph)        
+            node2_logits = self.mlp_node2(node2_feature).squeeze(1)  #(num_node + # of new node types * num_graph)        
         else:
-            node2_logits = self.agent_mlp_node2(node2_feature).squeeze(1)  #(num_node + 16 * num_graph)        
+            node2_logits = self.agent_mlp_node2(node2_feature).squeeze(1)  #(num_node + # of new node types * num_graph)        
 
         #mask the selected node1
         mask = torch.zeros(node2_logits.size(), device=self.device)
@@ -781,9 +815,12 @@ class GCPNGeneration(tasks.Task, core.Configurable):
         # step5: predict edge type
         is_new_node = label_dict["label2"] - graph.num_nodes # if an entry is non-negative, this is a new added node. (num_graph)
         graph_offset = torch.arange(graph.num_nodes.size(0), device=self.device)
+
+        ## TODO Look more into this
         node2_index_per_graph = torch.where(is_new_node >= 0, 
                     graph.num_node + graph_offset * self.id2atom.size(0) + is_new_node, 
                     label_dict["label2"] + graph.num_cum_nodes - graph.num_nodes) # (num_graph)
+        
         node2_index = node2_index_per_graph[extended_node2graph]
 
         edge_feature_node1 = node2_feature_node2[node1_index_per_graph] #(num_graph, n_out)
@@ -933,50 +970,70 @@ class GCPNGeneration(tasks.Task, core.Configurable):
     
     
     def MLE_forward(self, batch):
+        ## Forward pass for Graph Generation 
+
+        # Initialize the total loss and metrics dictionary.
         all_loss = torch.tensor(0, dtype=torch.float32, device=self.device)
         metric = {}
 
+        # Step 1: Extract the graph from the batch.
         graph = batch["graph"]
+
+        # Step 2: Generate all possible stop and edge graphs along with their corresponding labels.
         stop_graph, stop_label1, stop_label2, stop_label3, stop_label4 = self.all_stop(graph)
         edge_graph, edge_label1, edge_label2, edge_label3, edge_label4 = self.all_edge(graph)        
 
+        # Step 3: Concatenate stop and edge graphs to form a single graph for prediction.
         graph = self._cat([stop_graph, edge_graph])
         label1_target = torch.cat([stop_label1, edge_label1])
         label2_target = torch.cat([stop_label2, edge_label2])
         label3_target = torch.cat([stop_label3, edge_label3])
         label4_target = torch.cat([stop_label4, edge_label4])
         label_dict = {"label1": label1_target, "label2": label2_target, "label3": label3_target, "label4": label4_target}
+
+        # Step 4: Compute predictions for stop, node1, node2, and edge logits using the `predict` method.
         stop_logits, node1_logits, node2_logits, edge_logits, index_dict = self.predict(graph, label_dict)
 
+        # Step 5: Calculate individual losses for stop, node1, node2, and edge predictions.
+
+        # Calculate stop loss using negative log likelihood loss
         loss_stop = F.nll_loss(F.log_softmax(stop_logits, dim=-1), label4_target, reduction='none')
+
+        # Average the stop loss for both stopping (label4_target==0) and continuing (label4_target==1) conditions
         loss_stop = 0.5 * (torch.mean(loss_stop[label4_target==0]) + torch.mean(loss_stop[label4_target==1]))
         #loss_stop = torch.mean(loss_stop)
         metric["stop bce loss"] = loss_stop
         all_loss += loss_stop
 
+        # Calculate node1 loss using scatter log softmax
         loss_node1 = -(scatter_log_softmax(node1_logits, index_dict["extended_node2graph"])[index_dict["node1_index_per_graph"]])
         loss_node1 = torch.mean(loss_node1[label4_target==0])
         metric["node1 loss"] = loss_node1
         all_loss += loss_node1
 
+        # Calculate node2 loss using scatter log softmax
         loss_node2 = -(scatter_log_softmax(node2_logits, index_dict["extended_node2graph"])[index_dict["node2_index_per_graph"]])
         loss_node2 = torch.mean(loss_node2[label4_target==0])
         metric["node2 loss"] = loss_node2
         all_loss += loss_node2
 
+        # Calculate edge loss using negative log likelihood loss
         loss_edge = F.nll_loss(F.log_softmax(edge_logits, dim=-1), label3_target, reduction='none')
 
         loss_edge = torch.mean(loss_edge[label4_target==0])
         metric["edge loss"] = loss_edge
         all_loss += loss_edge
 
+        # Aggregate all losses to compute the total loss
         metric["total loss"] = all_loss
 
+        # Step 7: Compute metrics to evaluate the model performance
         pred = stop_logits, node1_logits, node2_logits, edge_logits
         target = label1_target, label2_target, label3_target, label4_target, index_dict
 
         metric.update(self.evaluate(pred, target))
 
+        # Step 8: Return the total loss and metrics
         return all_loss, metric
 
     def evaluate(self, pred, target):
@@ -1023,6 +1080,7 @@ class GCPNGeneration(tasks.Task, core.Configurable):
     @torch.no_grad()
     def _sample_action(self, graph, off_policy):
         if off_policy:
+            ## This optimizes using the agent
             model = self.agent_model
             new_atom_embeddings = self.agent_new_atom_embeddings
             mlp_stop = self.agent_mlp_stop
@@ -1030,6 +1088,7 @@ class GCPNGeneration(tasks.Task, core.Configurable):
             mlp_node2 = self.agent_mlp_node2
             mlp_edge = self.agent_mlp_edge
         else:
+            # this just mimics based on the Maximum Likelyhood Models
             model = self.model
             new_atom_embeddings = self.new_atom_embeddings
             mlp_stop = self.mlp_stop
@@ -1212,16 +1271,21 @@ class GCPNGeneration(tasks.Task, core.Configurable):
             has_new_node = (node2_action >= graph.num_nodes) & (stop_action == 0)
             new_atom_id = (node2_action - graph.num_nodes)[has_new_node]
             new_atom_type = self.id2atom[new_atom_id]
-
-            atom_type, num_nodes = functional._extend(graph.atom_type, graph.num_nodes, new_atom_type, has_new_node)
-
+            if self.node_type == "item":
+                atom_type, num_nodes = functional._extend(graph.item_type, graph.num_nodes, new_atom_type, has_new_node)
+            else:
+                atom_type, num_nodes = functional._extend(graph.atom_type, graph.num_nodes, new_atom_type, has_new_node)
             # tmp cast to regular node ids
             node2_action = torch.where(has_new_node, graph.num_nodes, node2_action)
 
             # tmp modify edges
             new_edge = torch.stack([node1_action, node2_action], dim=-1)
             edge_list = graph.edge_list.clone()
-            bond_type = graph.bond_type.clone()
+            if self.node_type:
+                bond_type = graph.anchor_type.clone()
+            else:
+                bond_type = graph.bond_type.clone()
+
             edge_list[:, :2] -= graph._offsets.unsqueeze(-1)
             is_modified_edge = (edge_list[:, :2] == new_edge[graph.edge2graph]).all(dim=-1) & \
                         (stop_action[graph.edge2graph] == 0)
@@ -1246,25 +1310,34 @@ class GCPNGeneration(tasks.Task, core.Configurable):
             new_edge_list = torch.stack([node2_action, node1_action, edge_action], dim=-1)[has_new_edge]
             bond_type = functional._extend(bond_type, num_edges, edge_action[has_new_edge], has_new_edge)[0]
             edge_list, num_edges = functional._extend(edge_list, num_edges, new_edge_list, has_new_edge)
-
-            tmp_graph = type(graph)(edge_list, atom_type=atom_type, bond_type=bond_type, num_nodes=num_nodes,
-                                    num_edges=num_edges, num_relation=graph.num_relation)
-            is_valid = tmp_graph.is_valid | (stop_action == 1)
-            if is_valid.all():
-                break
-        if not is_valid.all() and verbose:
-            num_invalid = len(graph) - is_valid.sum().item()
-            num_working = len(graph)
-            logger.warning("%d / %d molecules are invalid even after %d resampling" %
-                           (num_invalid, num_working, max_resample))
+            if self.node_type:
+                ## TODO is having features for newly added nodes important? 
+                tmp_graph = type(graph)(edge_list, item_type=atom_type, anchor_type=bond_type, num_nodes=num_nodes,
+                                        num_edges=num_edges, num_relation=graph.num_relation)
+                
+            else:
+                tmp_graph = type(graph)(edge_list, atom_type=atom_type, bond_type=bond_type, num_nodes=num_nodes,
+                                        num_edges=num_edges, num_relation=graph.num_relation)
+            # is_valid = tmp_graph.is_valid | (stop_action == 1)
+            # if is_valid.all():
+            #     break
+        # if not is_valid.all() and verbose:
+        #     num_invalid = len(graph) - is_valid.sum().item()
+        #     num_working = len(graph)
+        #     logger.warning("%d / %d molecules are invalid even after %d resampling" %
+        #                    (num_invalid, num_working, max_resample))
 
         # apply the true action
         # inherit attributes
         data_dict = graph.data_dict
         meta_dict = graph.meta_dict
-        for key in ["atom_type", "bond_type"]:
-            data_dict.pop(key)
-        # pad 0 for node / edge attributes
+        if self.node_type:
+            for key in ["item_type", "anchor_type"]:
+                data_dict.pop(key)
+        else:
+            for key in ["atom_type", "bond_type"]:
+                data_dict.pop(key)
+            # pad 0 for node / edge attributes
         for k, v in data_dict.items():
             if "node" in meta_dict[k]:
                 shape = (len(new_atom_type), *v.shape[1:])
@@ -1275,13 +1348,21 @@ class GCPNGeneration(tasks.Task, core.Configurable):
                 new_data = torch.zeros(shape, dtype=v.dtype, device=self.device)
                 data_dict[k] = functional._extend(v, graph.num_edges, new_data, has_new_edge * 2)[0]
 
-        new_graph = type(graph)(edge_list, atom_type=atom_type, bond_type=bond_type, num_nodes=num_nodes,
-                                num_edges=num_edges, num_relation=graph.num_relation,
-                                meta_dict=meta_dict, **data_dict)
+        if self.node_type:
+            new_graph = type(graph)(edge_list, item_type=atom_type, anchor_type=bond_type, num_nodes=num_nodes,
+                                    num_edges=num_edges, num_relation=graph.num_relation,
+                                    meta_dict=meta_dict, **data_dict)
+        else:
+            new_graph = type(graph)(edge_list, atom_type=atom_type, bond_type=bond_type, num_nodes=num_nodes,
+                                    num_edges=num_edges, num_relation=graph.num_relation,
+                                    meta_dict=meta_dict, **data_dict)
         with new_graph.graph():
             new_graph.is_stopped = stop_action == 1
 
-        new_graph, feature_valid = self._update_molecule_feature(new_graph)
+        if self.node_type:
+            new_graph, feature_valid = self._update_room_feature(new_graph)
+        else:
+            new_graph, feature_valid = self._update_molecule_feature(new_graph)
 
         return new_graph[feature_valid]
 
@@ -1311,6 +1392,16 @@ class GCPNGeneration(tasks.Task, core.Configurable):
 
         return graphs, valid
 
+    ## TODO This might become important when predicting node features
+
+    def _update_room_feature(self, graphs):
+        valid = [room is not None for room in graphs]
+        # node_mask = valid[graphs.node2graph]
+        # edge_mask = valid[graphs.edge2graph]
+
+        return graphs, valid
+
+
     def bn_train(self, mode=True):
         for module in self.modules():
             if isinstance(module, nn.BatchNorm1d):
@@ -1335,11 +1426,47 @@ class GCPNGeneration(tasks.Task, core.Configurable):
         self.best_results[task] = best_results
 
     @torch.no_grad()
-    def generate(self, num_sample, max_resample=20, off_policy=False, max_step=30 * 2, initial_smiles="C", verbose=0):
+    def generate(self, num_sample, max_resample=20, off_policy=False, max_step=30 * 2, initial_smiles="C", verbose=0, arch=False):
         is_training = self.training
         self.eval()
 
-        graph = data.Molecule.from_smiles(initial_smiles, kekulize=True, atom_feature="symbol").repeat(num_sample)
+        if arch == True:
+
+            # feature = torch.tensor([[ 1.0000e+00,  1.5358e+02,  1.2226e+02,  0.0000e+00,  0.0000e+00,
+            # 0.0000e+00,  2.7332e-01,  3.6093e-01],
+            # [ 2.0000e+00,  1.5388e+02,  1.2337e+02,  1.0000e+00,  1.0000e+00,
+            # 2.0000e+00,  2.9524e-01,  1.1032e+00],
+            # [ 1.0000e+00,  1.5456e+02,  1.1971e+02,  2.0000e+00,  2.0000e+00,
+            # 0.0000e+00,  4.7634e-01, -1.7004e-01]
+            # ], dtype=torch.float32)
+
+      
+
+            # adj_mat = torch.tensor([[[1.],
+            #                         [1.],
+            #                         [1.]],
+
+            #                         [[1.],
+            #                         [0.],
+            #                         [1.]],
+
+            #                         [[1.],
+            #                         [1.],
+            #                         [1.]]], dtype=torch.float32)
+            
+            # # Updated feature tensor with only the first node
+            feature = torch.tensor([[1.0],
+                                    [1.0]], dtype=torch.float32)
+            
+            adj_mat = torch.zeros((32, 32, 1))
+
+            # # Updated adjacency matrix with only one node and no edges
+            # adj_mat = torch.tensor([[[0.]]], dtype=torch.float32)
+
+            graph = data.Room.from_room_graph_definition(item_feature=feature, adj_matrix=adj_mat).repeat(num_sample)
+        else:
+            graph = data.Molecule.from_smiles(initial_smiles, kekulize=True, atom_feature="symbol").repeat(num_sample)
+
 
         # TODO: workaround
         if self.device.type == "cuda":
@@ -1386,7 +1513,9 @@ class GCPNGeneration(tasks.Task, core.Configurable):
 
         label1 = torch.zeros(len(graph), dtype=torch.long, device=self.device)
         label2 = torch.zeros_like(label1)
-        label3 = torch.zeros_like(label1)        
+        label3 = torch.zeros_like(label1)    
+        
+        # Returns 0s for label1, label2, label3 but for label4 (stop label) returns all 1s    
         return graph, label1, label2, label3, torch.ones(len(graph), dtype=torch.long, device=self.device)
 
 
@@ -1439,7 +1568,10 @@ class GCPNGeneration(tasks.Task, core.Configurable):
         node_in = circum_box_size - 1
         node_out = num_keep_dense_edges - node_in * circum_box_size
         # if we need to add a new node, what will be its atomid?
-        new_node_atomid = self.atom2id[graph.atom_type[starts +node_in]]
+        if self.node_type:
+            new_node_atomid = self.atom2id[graph.item_type[starts +node_in]]
+        else:
+            new_node_atomid = self.atom2id[graph.atom_type[starts +node_in]]
 
         # keep only the positive graph, as we will add an edge at each step
         new_graph = new_graph[positive_graph]

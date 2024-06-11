@@ -4,7 +4,7 @@ import ast
 import tempfile
 from contextlib import contextmanager
 
-from rdkit import RDLogger
+# from rdkit import RDLogger
 
 
 def input_choice(prompt, choice=("y", "n")):

@@ -1,6 +1,6 @@
-torch>=1.8.0
-torch-scatter>=2.0.8
-torch-cluster>=1.5.9
+torch==2.0.0
+torch-scatter==2.1.2
+torch-cluster==1.6.3
 decorator
 numpy>=1.11
 rdkit-pypi>=2020.9
@@ -11,3 +11,5 @@ ninja
 jinja2
 lmdb
 fair-esm
+azure-storage-blob
+pandas

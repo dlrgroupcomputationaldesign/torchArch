@@ -414,7 +414,6 @@ class RelationalGraphConv(MessagePassingBase):
 
     def message_and_aggregate(self, graph, input):
         assert graph.num_relation == self.num_relation
-
         node_in, node_out, relation = graph.edge_list.t()
         node_out = node_out * self.num_relation + relation
         degree_out = scatter_add(graph.edge_weight, node_out, dim_size=graph.num_node * graph.num_relation)
